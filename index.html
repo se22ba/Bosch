@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>VRM Multi-Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h1>VRM Multi-Dashboard</h1>
+
+  <!-- Config -->
+  <div class="card">
+    <div class="row row-3">
+      <div>
+        <label>URLs VRM Monitor / Status (una por línea)</label>
+        <textarea id="vrmUrls" rows="5" placeholder="http://vrm1/vrm_monitor/status
+http://vrm2/vrm_monitor/status"></textarea>
+        <div class="muted">Tip: si tu versión lo soporta, marcá <code>?format=json</code>.</div>
+      </div>
+      <div>
+        <label>Usuario (opcional)</label>
+        <input id="vrmUser" type="text" placeholder="readonly" />
+      </div>
+      <div>
+        <label>Contraseña (opcional)</label>
+        <input id="vrmPass" type="password" placeholder="••••••••" />
+      </div>
+    </div>
+
+    <div class="row row-2" style="margin-top:12px">
+      <div>
+        <label><input id="forceJson" type="checkbox" /> Forzar <code>?format=json</code></label>
+        <label><input id="downloadJson" type="checkbox" /> Descargar JSON normalizado</label>
+        <div class="muted">
+          Heurísticas: <code>sin avance</code> &gt; 10 min · <code>bitrate bajo</code> &lt; 64 kbps
+        </div>
+      </div>
+      <div class="actions">
+        <button id="btnRun">Consultar</button>
+        <span id="status" class="muted"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- KPIs -->
+  <div class="card">
+    <div class="kpis">
+      <div class="kpi k-bad">
+        <h3>Cámaras sin conexión</h3>
+        <div class="n" id="kpiNoConn">0</div>
+        <div class="muted">Sin stream detectable (heurística)</div>
+      </div>
+      <div class="kpi k-ok">
+        <h3>Cámaras operativas</h3>
+        <div class="n" id="kpiOper">0</div>
+        <div class="muted">Con stream y respuesta</div>
+      </div>
+      <div class="kpi k-info">
+        <h3>Cámaras grabando</h3>
+        <div class="n" id="kpiRecOn">0</div>
+        <div class="muted">Bloques asignados + avance reciente</div>
+      </div>
+      <div class="kpi k-warn">
+        <h3>Cámaras sin grabación</h3>
+        <div class="n" id="kpiRecOff">0</div>
+        <div class="muted">Sin bloques o sin avance</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Chart -->
+  <div class="card">
+    <div class="legend">
+      <span class="dot d-ok"></span> OK
+      <span class="dot d-warn"></span> Warn
+      <span class="dot d-bad"></span> Fail
+    </div>
+    <canvas id="donut" height="120"></canvas>
+  </div>
+
+  <!-- Tabla -->
+  <div class="card">
+    <div class="header">
+      <strong>Detalle de cámaras</strong>
+      <span id="totals" class="muted"></span>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>VRM</th>
+          <th>Nombre</th>
+          <th>Bloques</th>
+          <th>Bitrate (kbps)</th>
+          <th>Pool/LUN</th>
+          <th>Último write</th>
+          <th>Salud</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
