@@ -1,6 +1,6 @@
 // ===== Config =====
-const STALE_MIN = 10;   // sin avance de escritura => warn / no grabando
-const LOW_BITRATE = 64; // kbps => warn
+const STALE_MIN = 10;
+const LOW_BITRATE = 64;
 let chart;
 
 // ===== Helpers =====
@@ -13,11 +13,15 @@ function asInt(v){ const n=parseInt(v,10); return Number.isNaN(n)?0:n; }
 function parseTs(v){
   if(!v) return null;
   const t = Date.parse(v); if(!Number.isNaN(t)) return new Date(t);
-  const n = Number(v); if(!Number.isNaN(n) && n>100000) return new Date(n*1000); // epoch
+  const n = Number(v); if(!Number.isNaN(n) && n>100000) return new Date(n*1000);
   return null;
 }
+function isXmlRcp(text){ return typeof text === 'string' && /<rcp>/i.test(text) && /<str>/i.test(text); }
+function getU(map, id){ const v = map?.[id]; return typeof v === 'number' ? v : null; }
+function getS(map, id){ const v = map?.[id]; return typeof v === 'string' ? v : null; }
+function safeHost(u){ try{ const x=new URL(u); return x.origin; } catch{ return u.replace(/\/+$/,''); } }
 
-// ===== Normalización =====
+// ===== Normalización clásica (JSON/HTML) =====
 function toCamera(it){
   return {
     name: it.name || it.cameraName || it.id || '(sin nombre)',
@@ -25,7 +29,8 @@ function toCamera(it){
     bitrate_kbps: asInt(it.bitrate_kbps ?? it.bitrate ?? 0),
     pool: it.pool || null,
     lun: it.lun || null,
-    last_write_ts: parseTs(it.last_write_ts ?? it.last_write ?? it.lastWrite ?? it.last)
+    last_write_ts: parseTs(it.last_write_ts ?? it.last_write ?? it.lastWrite ?? it.last),
+    vrm: it.vrm || ''
   };
 }
 
@@ -36,8 +41,6 @@ function normalize(raw){
   }
   const doc = new DOMParser().parseFromString(raw, 'text/html');
   const cams = [];
-
-  // XML-like tags
   doc.querySelectorAll('camera, Camera, CAM').forEach(tag=>{
     cams.push(toCamera({
       name: tag.getAttribute('name') || tag.getAttribute('id') || (tag.textContent||'').trim(),
@@ -49,8 +52,6 @@ function normalize(raw){
     }));
   });
   if (cams.length) return cams;
-
-  // Tabla HTML
   doc.querySelectorAll('tr.camera-row, tr.cam-row, tr[data-type="camera"]').forEach(row=>{
     const cols=[...row.querySelectorAll('td,th')].map(c=>c.textContent.trim());
     cams.push(toCamera({
@@ -61,13 +62,97 @@ function normalize(raw){
   return cams;
 }
 
-// ===== Heurísticas =====
+// ===== RCP Context =====
+const vrmCtx = {};
+function rememberVrmContext(vrmKey, mapD028){
+  const vrmName = getS(mapD028, '0x000f'); // "VRM 172.20.67.94"
+  const lastWriteEpoch = getU(mapD028, '0x000a'); // epoch (si aplica)
+  if (!vrmCtx[vrmKey]) vrmCtx[vrmKey] = {};
+  if (vrmName) vrmCtx[vrmKey].vrm = vrmName.replace(/^VRM\s+/,'');
+  if (lastWriteEpoch) vrmCtx[vrmKey].last_write = new Date(lastWriteEpoch * 1000);
+}
+
+// ===== parse 0xD062 → devices =====
+function parseD062ToDevices(text, vrmKey){
+  const bytes = window.RCP.extractRcpBytesFromXml(text);
+  const rows  = window.RCP.parseRcpTLV(bytes);
+
+  // Heurística: un nuevo "device block" empieza cuando aparece un campo URL UTF-16 (id 0x0006)
+  const blocks = [];
+  let current = null;
+
+  function push(){ if (current) blocks.push(current); current=null; }
+  for (const r of rows){
+    const id = '0x' + r.id.toString(16).padStart(4,'0');
+    // nuevo bloque si llega 0x0006 UTF-16 con "https://"
+    if (id === '0x0006' && typeof r.value === 'string' && r.value.startsWith('https://')) {
+      push();
+      current = { fields: {}, url: r.value };
+    }
+    if (!current) continue;
+    current.fields[id] = r.value;
+  }
+  push();
+
+  // map a objetos "camera-like"
+  const ctx = vrmCtx[vrmKey] || {};
+  const list = blocks.map(b=>{
+    // status: 0x0008 (U8) = 1 ⇒ online
+    const online = Number(b.fields['0x0008']) === 1;
+    const model  = (b.fields['0x0014'] && String(b.fields['0x0014'])) // UTF-16 nombre legible
+                || (b.fields['0x0009'] && String(b.fields['0x0009'])) // modelo/alias
+                || '---';
+
+    // last write candidato (ajustable): 0x001d ó 0x000d/0x000f si parecen epoch
+    const lw = ['0x001d','0x000f','0x000d','0x000a']
+      .map(k=>Number(b.fields[k]))
+      .find(n => Number.isFinite(n) && n > 100000);
+    const lastWrite = lw ? new Date(lw * 1000) : (ctx.last_write || null);
+
+    return {
+      vrm: ctx.vrm || vrmKey,
+      name: model,
+      assigned_blocks: 0,
+      bitrate_kbps: 0,
+      pool: null,
+      lun: null,
+      last_write_ts: lastWrite,
+      _status: online ? 'Online' : 'Offline',
+      _health: online ? 'ok' : 'bad'
+    };
+  });
+
+  return list;
+}
+
+function normalizeRcpXml(text, sourceUrl){
+  const cmd = window.RCP.extractCommandHex(text) || '';
+  const host = (()=>{
+    try{ return new URL(sourceUrl).host; } catch{ return sourceUrl; }
+  })();
+
+  if (cmd === '0xd028') {
+    const map = window.RCP.tlvToMap(window.RCP.parseRcpTLV(window.RCP.extractRcpBytesFromXml(text)));
+    rememberVrmContext(host, map);
+    return [];
+  }
+  if (cmd === '0xd062') {
+    return parseD062ToDevices(text, host);
+  }
+  // Si llega 0xD02B/otros, podríamos sumarlos aquí, pero con D062 ya listamos devices.
+  return [];
+}
+
+// ===== Heurísticas UI =====
 function health(c){
+  if (c._health) {
+    if (c._health === 'ok')   return { cls:'ok', text:'✅ operativa' };
+    if (c._health === 'bad')  return { cls:'bad', text:'❌ sin conexión' };
+  }
   const hasBlocks = (c.assigned_blocks||0) > 0;
   const hasBitrate = (c.bitrate_kbps||0) > 0;
   let mins = null;
   if (c.last_write_ts) mins = (Date.now()-c.last_write_ts.getTime())/60000;
-
   if (!hasBitrate && !hasBlocks && (mins===null || mins>STALE_MIN)) {
     return { cls:'bad', text:'❌ sin conexión' };
   }
@@ -106,8 +191,8 @@ function renderAll(rows){
     const td=t=>{ const x=document.createElement('td'); x.textContent=t; return x; };
     tr.appendChild(td(c.vrm||''));                                // VRM
     tr.appendChild(td(c.name));                                   // Nombre
-    tr.appendChild(td(c.assigned_blocks));                        // Bloques
-    tr.appendChild(td(c.bitrate_kbps));                           // Bitrate
+    tr.appendChild(td(c.assigned_blocks ?? 0));                   // Bloques
+    tr.appendChild(td(c.bitrate_kbps ?? 0));                      // Bitrate
     tr.appendChild(td([c.pool,c.lun].filter(Boolean).join('/'))); // Pool/LUN
     tr.appendChild(td(c.last_write_ts?c.last_write_ts.toLocaleString():'')); // Last write
     const t7=document.createElement('td');
@@ -131,16 +216,24 @@ function renderDonut(ok,warn,bad){
   });
 }
 
-// ===== Fetch VRM =====
-async function fetchVRM(url, user, pass, forceJson){
-  const target = forceJson ? addParam(url,'format','json') : url;
+// ===== Fetch =====
+async function fetchAny(url, user, pass){
   const headers = {};
   if (user || pass) headers['Authorization'] = basicAuth(user||'', pass||'');
-  const r = await fetch(target, { headers });
+  const r = await fetch(url, { headers });
   if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
   const ct = (r.headers.get('content-type')||'').toLowerCase();
-  if (ct.includes('application/json')) return await r.json();
-  return await r.text(); // HTML/XML
+  if (ct.includes('application/json')) return { kind:'json', body: await r.json() };
+  const text = await r.text();
+  if (isXmlRcp(text)) return { kind:'rcp', body:text };
+  return { kind:'html', body:text };
+}
+
+// Construye endpoints RCP a partir de una URL base del VRM
+function buildRcpEndpointsFromBase(u){
+  const base = safeHost(u).replace(/\/vrmcockpit\/?$/,''); // limpia /vrmcockpit si vino
+  const rcp = (cmd) => `${base}/rcp.xml?command=${cmd}&type=P_OCTET&direction=READ`;
+  return [ rcp('0xD028'), rcp('0xD062') ];
 }
 
 // ===== Wire-up =====
@@ -151,25 +244,36 @@ document.getElementById('btnRun').addEventListener('click', async ()=>{
 
   try{
     const lines = document.getElementById('vrmUrls').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    if (!lines.length) throw new Error('Ingresá al menos una URL de VRM');
+    if (!lines.length) throw new Error('Ingresá al menos una URL del VRM o rcp.xml');
     const user = document.getElementById('vrmUser').value.trim();
     const pass = document.getElementById('vrmPass').value.trim();
-    const forceJson = document.getElementById('forceJson').checked;
     const wantDownload = document.getElementById('downloadJson').checked;
 
-    const results = await Promise.allSettled(lines.map(u => fetchVRM(u, user, pass, forceJson)));
+    // Expande cada línea: si es base, arma 0xD028 y 0xD062; si ya es rcp.xml, la deja
+    const targets = [];
+    for (const u of lines){
+      if (/rcp\.xml/i.test(u)) targets.push(u);
+      else targets.push(...buildRcpEndpointsFromBase(u));
+    }
+
+    const results = await Promise.allSettled(targets.map(u => fetchAny(u, user, pass)));
 
     const camsAll = [];
     const errors = [];
-    results.forEach((res, i)=>{
-      const vrm = lines[i];
-      if (res.status === 'fulfilled') {
-        const cams = normalize(res.value).map(c => ({...c, vrm}));
+    for (let i=0;i<results.length;i++){
+      const src = targets[i];
+      const res = results[i];
+      if (res.status !== 'fulfilled') { errors.push(`${src}: ${res.reason}`); continue; }
+      const { kind, body } = res.value;
+
+      if (kind === 'json' || kind === 'html') {
+        const cams = normalize(body).map(c => ({...c, vrm:''}));
         camsAll.push(...cams);
-      } else {
-        errors.push(`${vrm}: ${res.reason}`);
+      } else if (kind === 'rcp') {
+        const list = normalizeRcpXml(body, src);
+        camsAll.push(...list);
       }
-    });
+    }
 
     renderAll(camsAll);
     status.textContent = `OK (${camsAll.length} cámaras${errors.length?`, errores: ${errors.length}`:''})`;
@@ -178,9 +282,10 @@ document.getElementById('btnRun').addEventListener('click', async ()=>{
     if (wantDownload){
       const plain = camsAll.map(c=>({
         vrm:c.vrm, name:c.name,
-        assigned_blocks:c.assigned_blocks, bitrate_kbps:c.bitrate_kbps,
+        assigned_blocks:c.assigned_blocks ?? 0, bitrate_kbps:c.bitrate_kbps ?? 0,
         pool:c.pool, lun:c.lun,
-        last_write_ts: c.last_write_ts ? c.last_write_ts.toISOString() : null
+        last_write_ts: c.last_write_ts ? c.last_write_ts.toISOString() : null,
+        status: c._status || null
       }));
       const blob = new Blob([JSON.stringify(plain,null,2)], {type:'application/json'});
       const url = URL.createObjectURL(blob);
