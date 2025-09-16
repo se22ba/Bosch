@@ -1,18 +1,9 @@
-function buildRcpEndpointsFromBase(u){
-// Usa proxy local
-const base = u.replace(/\/+$/,'');
-return [
-`/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD028`,
-`/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD062`
-];
-}
 // ===== Config =====
-const STALE_MIN = 10;
-const LOW_BITRATE = 64;
+const STALE_MIN = 10;   // sin avance de escritura => no grabando
+const LOW_BITRATE = 64; // kbps => warn
 let chart;
 
 // ===== Helpers =====
-function basicAuth(u,p){ return 'Basic '+btoa(`${u}:${p}`); }
 function addParam(url, k, v){
   try{ const u=new URL(url); u.searchParams.set(k,v); return u.toString(); }
   catch{ return url+(url.includes('?')?'&':'?')+encodeURIComponent(k)+'='+encodeURIComponent(v); }
@@ -27,9 +18,18 @@ function parseTs(v){
 function isXmlRcp(text){ return typeof text === 'string' && /<rcp>/i.test(text) && /<str>/i.test(text); }
 function getU(map, id){ const v = map?.[id]; return typeof v === 'number' ? v : null; }
 function getS(map, id){ const v = map?.[id]; return typeof v === 'string' ? v : null; }
-function safeHost(u){ try{ const x=new URL(u); return x.origin; } catch{ return u.replace(/\/+$/,''); } }
 
-// ===== Normalización clásica (JSON/HTML) =====
+// ===== Construye endpoints RCP usando SIEMPRE el proxy local =====
+function buildRcpEndpointsFromBase(u){
+  // u puede venir como https://IP o https://IP/vrmcockpit
+  const base = u.replace(/\/vrmcockpit\/?$/,'').replace(/\/+$/,'');
+  return [
+    `/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD028`,
+    `/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD062`
+  ];
+}
+
+// ===== Normalización (para entradas JSON/HTML opcionales) =====
 function toCamera(it){
   return {
     name: it.name || it.cameraName || it.id || '(sin nombre)',
@@ -49,6 +49,8 @@ function normalize(raw){
   }
   const doc = new DOMParser().parseFromString(raw, 'text/html');
   const cams = [];
+
+  // XML-like
   doc.querySelectorAll('camera, Camera, CAM').forEach(tag=>{
     cams.push(toCamera({
       name: tag.getAttribute('name') || tag.getAttribute('id') || (tag.textContent||'').trim(),
@@ -60,6 +62,8 @@ function normalize(raw){
     }));
   });
   if (cams.length) return cams;
+
+  // Tabla HTML
   doc.querySelectorAll('tr.camera-row, tr.cam-row, tr[data-type="camera"]').forEach(row=>{
     const cols=[...row.querySelectorAll('td,th')].map(c=>c.textContent.trim());
     cams.push(toCamera({
@@ -70,29 +74,27 @@ function normalize(raw){
   return cams;
 }
 
-// ===== RCP Context =====
+// ===== RCP → contexto VRM y devices =====
 const vrmCtx = {};
 function rememberVrmContext(vrmKey, mapD028){
-  const vrmName = getS(mapD028, '0x000f'); // "VRM 172.20.67.94"
-  const lastWriteEpoch = getU(mapD028, '0x000a'); // epoch (si aplica)
+  const vrmName = getS(mapD028, '0x000f'); // "VRM x.x.x.x"
+  const lastWriteEpoch = getU(mapD028, '0x000a'); // U32 LE (si aplica)
   if (!vrmCtx[vrmKey]) vrmCtx[vrmKey] = {};
   if (vrmName) vrmCtx[vrmKey].vrm = vrmName.replace(/^VRM\s+/,'');
   if (lastWriteEpoch) vrmCtx[vrmKey].last_write = new Date(lastWriteEpoch * 1000);
 }
 
-// ===== parse 0xD062 → devices =====
 function parseD062ToDevices(text, vrmKey){
   const bytes = window.RCP.extractRcpBytesFromXml(text);
   const rows  = window.RCP.parseRcpTLV(bytes);
 
-  // Heurística: un nuevo "device block" empieza cuando aparece un campo URL UTF-16 (id 0x0006)
+  // Segmentación de bloques por aparición de id 0x0006 (URL UTF-16 "https://...")
   const blocks = [];
   let current = null;
-
   function push(){ if (current) blocks.push(current); current=null; }
+
   for (const r of rows){
     const id = '0x' + r.id.toString(16).padStart(4,'0');
-    // nuevo bloque si llega 0x0006 UTF-16 con "https://"
     if (id === '0x0006' && typeof r.value === 'string' && r.value.startsWith('https://')) {
       push();
       current = { fields: {}, url: r.value };
@@ -102,16 +104,14 @@ function parseD062ToDevices(text, vrmKey){
   }
   push();
 
-  // map a objetos "camera-like"
   const ctx = vrmCtx[vrmKey] || {};
-  const list = blocks.map(b=>{
-    // status: 0x0008 (U8) = 1 ⇒ online
-    const online = Number(b.fields['0x0008']) === 1;
-    const model  = (b.fields['0x0014'] && String(b.fields['0x0014'])) // UTF-16 nombre legible
-                || (b.fields['0x0009'] && String(b.fields['0x0009'])) // modelo/alias
+  return blocks.map(b=>{
+    const online = Number(b.fields['0x0008']) === 1; // flag online
+    const model  = (b.fields['0x0014'] && String(b.fields['0x0014']))
+                || (b.fields['0x0009'] && String(b.fields['0x0009']))
                 || '---';
 
-    // last write candidato (ajustable): 0x001d ó 0x000d/0x000f si parecen epoch
+    // last write candidato (ajustable): probamos varias keys con pinta de epoch
     const lw = ['0x001d','0x000f','0x000d','0x000a']
       .map(k=>Number(b.fields[k]))
       .find(n => Number.isFinite(n) && n > 100000);
@@ -129,38 +129,39 @@ function parseD062ToDevices(text, vrmKey){
       _health: online ? 'ok' : 'bad'
     };
   });
-
-  return list;
 }
 
 function normalizeRcpXml(text, sourceUrl){
   const cmd = window.RCP.extractCommandHex(text) || '';
-  const host = (()=>{
-    try{ return new URL(sourceUrl).host; } catch{ return sourceUrl; }
-  })();
+  let vrmKey = '';
+  try { vrmKey = new URL(sourceUrl, location.origin).searchParams.get('vrm') || ''; } catch {}
 
   if (cmd === '0xd028') {
     const map = window.RCP.tlvToMap(window.RCP.parseRcpTLV(window.RCP.extractRcpBytesFromXml(text)));
-    rememberVrmContext(host, map);
+    // usamos el host/IP del parámetro vrm como key
+    let key = vrmKey.replace(/^https?:\/\//,'').replace(/\/.*/,'');
+    rememberVrmContext(key || vrmKey || 'vrm', map);
     return [];
   }
   if (cmd === '0xd062') {
-    return parseD062ToDevices(text, host);
+    // mismo criterio de key
+    let key = vrmKey.replace(/^https?:\/\//,'').replace(/\/.*/,'');
+    return parseD062ToDevices(text, key || vrmKey || 'vrm');
   }
-  // Si llega 0xD02B/otros, podríamos sumarlos aquí, pero con D062 ya listamos devices.
   return [];
 }
 
-// ===== Heurísticas UI =====
+// ===== Heurísticas de UI =====
 function health(c){
   if (c._health) {
-    if (c._health === 'ok')   return { cls:'ok', text:'✅ operativa' };
+    if (c._health === 'ok')   return { cls:'ok',  text:'✅ operativa' };
     if (c._health === 'bad')  return { cls:'bad', text:'❌ sin conexión' };
   }
   const hasBlocks = (c.assigned_blocks||0) > 0;
   const hasBitrate = (c.bitrate_kbps||0) > 0;
   let mins = null;
   if (c.last_write_ts) mins = (Date.now()-c.last_write_ts.getTime())/60000;
+
   if (!hasBitrate && !hasBlocks && (mins===null || mins>STALE_MIN)) {
     return { cls:'bad', text:'❌ sin conexión' };
   }
@@ -198,7 +199,7 @@ function renderAll(rows){
     const tr=document.createElement('tr');
     const td=t=>{ const x=document.createElement('td'); x.textContent=t; return x; };
     tr.appendChild(td(c.vrm||''));                                // VRM
-    tr.appendChild(td(c.name));                                   // Nombre
+    tr.appendChild(td(c.name));                                   // Nombre / modelo
     tr.appendChild(td(c.assigned_blocks ?? 0));                   // Bloques
     tr.appendChild(td(c.bitrate_kbps ?? 0));                      // Bitrate
     tr.appendChild(td([c.pool,c.lun].filter(Boolean).join('/'))); // Pool/LUN
@@ -224,24 +225,15 @@ function renderDonut(ok,warn,bad){
   });
 }
 
-// ===== Fetch =====
-async function fetchAny(url, user, pass){
-  const headers = {};
-  if (user || pass) headers['Authorization'] = basicAuth(user||'', pass||'');
-  const r = await fetch(url, { headers });
+// ===== Fetch genérico =====
+async function fetchAny(url){
+  const r = await fetch(url); // siempre al proxy (mismo origen)
   if (!r.ok) throw new Error(`HTTP ${r.status} en ${url}`);
   const ct = (r.headers.get('content-type')||'').toLowerCase();
   if (ct.includes('application/json')) return { kind:'json', body: await r.json() };
   const text = await r.text();
   if (isXmlRcp(text)) return { kind:'rcp', body:text };
   return { kind:'html', body:text };
-}
-
-// Construye endpoints RCP a partir de una URL base del VRM
-function buildRcpEndpointsFromBase(u){
-  const base = safeHost(u).replace(/\/vrmcockpit\/?$/,''); // limpia /vrmcockpit si vino
-  const rcp = (cmd) => `${base}/rcp.xml?command=${cmd}&type=P_OCTET&direction=READ`;
-  return [ rcp('0xD028'), rcp('0xD062') ];
 }
 
 // ===== Wire-up =====
@@ -252,19 +244,16 @@ document.getElementById('btnRun').addEventListener('click', async ()=>{
 
   try{
     const lines = document.getElementById('vrmUrls').value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    if (!lines.length) throw new Error('Ingresá al menos una URL del VRM o rcp.xml');
-    const user = document.getElementById('vrmUser').value.trim();
-    const pass = document.getElementById('vrmPass').value.trim();
-    const wantDownload = document.getElementById('downloadJson').checked;
+    if (!lines.length) throw new Error('Ingresá al menos una URL del VRM (https://IP o https://IP/vrmcockpit)');
+    const wantDownload = document.getElementById('downloadJson')?.checked;
 
-    // Expande cada línea: si es base, arma 0xD028 y 0xD062; si ya es rcp.xml, la deja
+    // Expandir SIEMPRE a /api/rcp… (proxy)
     const targets = [];
     for (const u of lines){
-      if (/rcp\.xml/i.test(u)) targets.push(u);
-      else targets.push(...buildRcpEndpointsFromBase(u));
+      targets.push(...buildRcpEndpointsFromBase(u));
     }
 
-    const results = await Promise.allSettled(targets.map(u => fetchAny(u, user, pass)));
+    const results = await Promise.allSettled(targets.map(u => fetchAny(u)));
 
     const camsAll = [];
     const errors = [];
