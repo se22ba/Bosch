@@ -1,3 +1,11 @@
+function buildRcpEndpointsFromBase(u){
+// Usa proxy local
+const base = u.replace(/\/+$/,'');
+return [
+`/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD028`,
+`/api/rcp?vrm=${encodeURIComponent(base)}&cmd=0xD062`
+];
+
 // ===== Config =====
 const STALE_MIN = 10;
 const LOW_BITRATE = 64;
