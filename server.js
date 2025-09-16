@@ -1,3 +1,7 @@
+// server.js — Proxy VRM usando https.request (sin fetch), tolerante a TLS/cert viejos.
+// Requiere: npm i express dotenv
+// Ejecuta:  node server.js   →  http://localhost:3000
+
 const express = require('express');
 const path = require('path');
 const https = require('https');
@@ -8,7 +12,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS básico para el front
+// CORS básico
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -16,7 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// sirve tu front (index.html, app.js, rcp-decoder.js, styles.css)
+// Sirve tu front (index.html, app.js, rcp-decoder.js, styles.css)
 app.use(express.static(path.join(__dirname)));
 
 function cleanBase(vrm) {
@@ -24,18 +28,18 @@ function cleanBase(vrm) {
 }
 
 function resolveAuth(req) {
-  if (req.headers['authorization']) return req.headers['authorization']; // header que mande el browser
+  // 1) Header Authorization si el cliente lo manda
+  if (req.headers['authorization']) return req.headers['authorization'];
+  // 2) Query ?user=&pass=
   const u = req.query.user || process.env.VRM_USER || '';
   const p = req.query.pass || process.env.VRM_PASS || '';
   if (u || p) return 'Basic ' + Buffer.from(`${u}:${p}`).toString('base64');
   return undefined;
 }
 
-// Hacer GET crudo al VRM usando https.request para controlar TLS
 function doHttpsGetText(targetUrl, headers = {}) {
   return new Promise((resolve, reject) => {
     const url = new URL(targetUrl);
-
     const isHttps = url.protocol === 'https:';
     const lib = isHttps ? https : http;
 
@@ -46,26 +50,20 @@ function doHttpsGetText(targetUrl, headers = {}) {
       path: url.pathname + (url.search || ''),
       method: 'GET',
       headers,
-      // TLS super permisivo (para VRM con cert/IP/SAN/ciphers raros)
+      // TLS permisivo (equipos con cert/IP/ciphers raros)
       rejectUnauthorized: false,
       minVersion: 'TLSv1',
       maxVersion: 'TLSv1.3',
       ciphers: 'ALL:@SECLEVEL=0',
       honorCipherOrder: true,
-      // Evitar validación de CN/SAN (vamos por IP)
-      checkServerIdentity: () => undefined,
-      // A veces ayuda quitar SNI cuando el cert es viejo
-      servername: undefined,
-      // Forzar IPv4 si hubiera DNS (acá usás IP, así que no aplica, pero lo dejo por si mañana usas FQDN)
-      lookup: (host, opts, cb) => cb(null, host, 4),
-      // No keep-alive para evitar problemas con servidores antiguos
-      agent: false,
-      timeout: 12000, // 12s
+      checkServerIdentity: () => undefined,  // evita CN/SAN mismatch
+      servername: undefined,                 // quita SNI (ayuda con cert viejos)
+      lookup: (host, _opts, cb) => cb(null, host, 4), // fuerza IPv4
+      agent: false,            // sin keep-alive (equipos antiguos agradecen)
+      timeout: 12000,
     };
 
-    // Log visible (para debug)
     console.log(`[RAW] → ${opts.protocol}//${opts.hostname}:${opts.port}${opts.path}`);
-
     const req = lib.request(opts, (res) => {
       let data = '';
       res.setEncoding('utf8');
@@ -77,14 +75,10 @@ function doHttpsGetText(targetUrl, headers = {}) {
     });
 
     req.on('error', (err) => {
-      console.error('[RAW][ERROR]', err.code || '', err.message || err);
+      console.error('[RAW][ERROR]', err?.code || '', err?.message || err);
       reject(err);
     });
-
-    req.on('timeout', () => {
-      req.destroy(new Error('ETIMEDOUT'));
-    });
-
+    req.on('timeout', () => req.destroy(new Error('ETIMEDOUT')));
     req.end();
   });
 }
@@ -102,10 +96,8 @@ app.get('/api/rcp', async (req, res) => {
     if (auth) headers['Authorization'] = auth;
 
     console.log('[PROXY] →', url, 'Auth?', !!auth);
-
     const r = await doHttpsGetText(url, headers);
 
-    // Reexpongo tal cual el content-type si vino
     res.setHeader('Content-Type', r.headers['content-type'] || 'application/xml; charset=utf-8');
     res.status(r.status).send(r.body);
   } catch (e) {
